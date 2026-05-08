@@ -69,6 +69,7 @@ from langchain_openai.chat_models.base import (
     OpenAIRefusalError,
     _construct_lc_result_from_responses_api,
     _construct_responses_api_input,
+    _convert_delta_to_message_chunk,
     _convert_dict_to_message,
     _convert_message_to_dict,
     _convert_to_openai_response_format,
@@ -314,6 +315,117 @@ def test__convert_dict_to_message_tool_call() -> None:
         reverted_message_dict["tool_calls"], key=lambda x: x["id"]
     )
     assert reverted_message_dict == message
+
+
+def test__convert_dict_to_message_tool_call_extras_round_trip() -> None:
+    """Non-OpenAI-spec fields on a tool_call (e.g. Gemini's
+    ``extra_content.google.thought_signature``) survive the incoming -> outgoing
+    round-trip via ``additional_kwargs[\"__openai_tool_call_extras__\"]``.
+    """
+    raw_tool_call = {
+        "id": "call_abc",
+        "type": "function",
+        "function": {"name": "greet", "arguments": "{}"},
+        "extra_content": {"google": {"thought_signature": "SIG=="}},
+    }
+    message = {"role": "assistant", "content": None, "tool_calls": [raw_tool_call]}
+    result = _convert_dict_to_message(message)
+    assert isinstance(result, AIMessage)
+    assert result.tool_calls[0]["id"] == "call_abc"
+    assert result.additional_kwargs["__openai_tool_call_extras__"] == {
+        "call_abc": {"extra_content": {"google": {"thought_signature": "SIG=="}}}
+    }
+    out = _convert_message_to_dict(result)
+    assert out["tool_calls"][0]["extra_content"] == {
+        "google": {"thought_signature": "SIG=="}
+    }
+    assert out["tool_calls"][0]["function"] == {"name": "greet", "arguments": "{}"}
+
+
+def test__convert_message_to_dict_tool_call_no_extras_unchanged() -> None:
+    """Without extras, the outgoing dict is byte-identical to the pre-fix output."""
+    message = AIMessage(
+        content="",
+        tool_calls=[
+            ToolCall(name="f", args={"a": 1}, id="x", type="tool_call"),
+        ],
+    )
+    out = _convert_message_to_dict(message)
+    assert out["tool_calls"] == [
+        {
+            "type": "function",
+            "id": "x",
+            "function": {"name": "f", "arguments": '{"a": 1}'},
+        }
+    ]
+
+
+def test__convert_delta_to_message_chunk_tool_call_extras_streaming_merge() -> None:
+    """Two streamed deltas (extras+id on first, args completion on second, same
+    ``index``) merge such that final extras are keyed by the resolved ``id``.
+    """
+    delta1 = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_z",
+                "type": "function",
+                "function": {"name": "greet", "arguments": ""},
+                "extra_content": {"google": {"thought_signature": "S"}},
+            }
+        ],
+    }
+    delta2 = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"index": 0, "function": {"arguments": "{}"}}],
+    }
+    c1 = _convert_delta_to_message_chunk(delta1, AIMessageChunk)
+    c2 = _convert_delta_to_message_chunk(delta2, AIMessageChunk)
+    merged = c1 + c2
+    assert isinstance(merged, AIMessageChunk)
+    assert merged.additional_kwargs["__openai_tool_call_extras__"] == {
+        "call_z": {"extra_content": {"google": {"thought_signature": "S"}}}
+    }
+    # Reconciled to id at serialization time.
+    out = _convert_message_to_dict(merged)
+    assert out["tool_calls"][0]["extra_content"] == {
+        "google": {"thought_signature": "S"}
+    }
+
+
+def test__convert_message_to_dict_raw_tool_calls_escape_hatch_no_extras_merge() -> None:
+    """When the typed ``tool_calls`` field is empty but the legacy raw
+    ``additional_kwargs['tool_calls']`` escape hatch is populated, that branch
+    is owner-of-record: extras stashed under the side-channel key must NOT be
+    merged on top of the raw tool_calls (the existing strip-to-{id,type,function}
+    invariant is preserved).
+    """
+    # Construct then mutate to avoid AIMessage's post-init promotion of
+    # additional_kwargs["tool_calls"] into the typed `tool_calls` field.
+    message = AIMessage(content="")
+    message.additional_kwargs["tool_calls"] = [
+        {
+            "id": "x",
+            "type": "function",
+            "function": {"name": "f", "arguments": "{}"},
+            "extra_content": {"should_be_stripped": True},
+        }
+    ]
+    message.additional_kwargs["__openai_tool_call_extras__"] = {
+        "x": {"extra_content": {"side_channel_should_not_be_merged": True}}
+    }
+    assert message.tool_calls == []
+    out = _convert_message_to_dict(message)
+    assert out["tool_calls"] == [
+        {
+            "id": "x",
+            "type": "function",
+            "function": {"name": "f", "arguments": "{}"},
+        }
+    ]
 
 
 class MockAsyncContextManager:

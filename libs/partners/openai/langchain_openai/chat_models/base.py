@@ -195,6 +195,29 @@ WellKnownTools = (
 )
 
 
+# Side-channel for non-OpenAI-spec fields on individual tool_call entries
+# (e.g. Gemini's `extra_content.google.thought_signature`). Captured here on
+# incoming and replayed in `_convert_message_to_dict` on outgoing so multi-turn
+# tool calling against OpenAI-compatible providers preserves provider-required
+# metadata. Mirrors the message-level `audio` precedent below.
+_OPENAI_TOOL_CALL_EXTRAS_KEY = "__openai_tool_call_extras__"
+_RESERVED_TOOL_CALL_KEYS = frozenset({"id", "type", "function", "index"})
+
+
+def _capture_tool_call_extras(
+    raw_tool_call: Mapping[str, Any],
+    fallback_key: str | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Return (key, extras) for a raw tool_call dict, or (None, {}) if no extras."""
+    extras = {
+        k: v for k, v in raw_tool_call.items() if k not in _RESERVED_TOOL_CALL_KEYS
+    }
+    if not extras:
+        return None, {}
+    key = raw_tool_call.get("id") or fallback_key
+    return key, extras
+
+
 def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
     """Convert a dictionary to a LangChain message.
 
@@ -218,6 +241,7 @@ def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
             additional_kwargs["function_call"] = dict(function_call)
         tool_calls = []
         invalid_tool_calls = []
+        tool_call_extras: dict[str, dict[str, Any]] = {}
         if raw_tool_calls := _dict.get("tool_calls"):
             for raw_tool_call in raw_tool_calls:
                 try:
@@ -226,6 +250,11 @@ def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
                     invalid_tool_calls.append(
                         make_invalid_tool_call(raw_tool_call, str(e))
                     )
+                key, extras = _capture_tool_call_extras(raw_tool_call)
+                if key and extras:
+                    tool_call_extras[key] = extras
+        if tool_call_extras:
+            additional_kwargs[_OPENAI_TOOL_CALL_EXTRAS_KEY] = tool_call_extras
         if audio := _dict.get("audio"):
             additional_kwargs["audio"] = audio
         return AIMessage(
@@ -362,13 +391,30 @@ def _convert_message_to_dict(
     elif isinstance(message, AIMessage):
         message_dict["role"] = "assistant"
         if message.tool_calls or message.invalid_tool_calls:
+            extras_map: dict[str, dict[str, Any]] = dict(
+                message.additional_kwargs.get(_OPENAI_TOOL_CALL_EXTRAS_KEY, {})
+            )
+            # Reconcile any streaming-time `__index_N` placeholders to the now-known
+            # tool_call ids before serializing.
+            for i, tc in enumerate(message.tool_calls):
+                placeholder = f"__index_{i}"
+                tc_id = tc.get("id")
+                if placeholder in extras_map and tc_id and tc_id not in extras_map:
+                    extras_map[tc_id] = extras_map.pop(placeholder)
             message_dict["tool_calls"] = [
-                _lc_tool_call_to_openai_tool_call(tc) for tc in message.tool_calls
+                _lc_tool_call_to_openai_tool_call(
+                    tc, extras_map.get(tc.get("id") or "")
+                )
+                for tc in message.tool_calls
             ] + [
-                _lc_invalid_tool_call_to_openai_tool_call(tc)
+                _lc_invalid_tool_call_to_openai_tool_call(
+                    tc, extras_map.get(tc.get("id") or "")
+                )
                 for tc in message.invalid_tool_calls
             ]
         elif "tool_calls" in message.additional_kwargs:
+            # Raw escape hatch: when the user sets additional_kwargs["tool_calls"]
+            # directly, that's owner-of-record and we do not merge extras on top.
             message_dict["tool_calls"] = message.additional_kwargs["tool_calls"]
             tool_call_supported_props = {"id", "type", "function"}
             message_dict["tool_calls"] = [
@@ -439,6 +485,7 @@ def _convert_delta_to_message_chunk(
             function_call["name"] = ""
         additional_kwargs["function_call"] = function_call
     tool_call_chunks = []
+    tool_call_extras: dict[str, dict[str, Any]] = {}
     if raw_tool_calls := _dict.get("tool_calls"):
         try:
             tool_call_chunks = [
@@ -452,6 +499,13 @@ def _convert_delta_to_message_chunk(
             ]
         except KeyError:
             pass
+        for rtc in raw_tool_calls:
+            fallback = f"__index_{rtc['index']}" if "index" in rtc else None
+            key, extras = _capture_tool_call_extras(rtc, fallback_key=fallback)
+            if key and extras:
+                tool_call_extras[key] = extras
+    if tool_call_extras:
+        additional_kwargs[_OPENAI_TOOL_CALL_EXTRAS_KEY] = tool_call_extras
 
     if role == "user" or default_class == HumanMessageChunk:
         return HumanMessageChunk(content=content, id=id_)
@@ -3775,8 +3829,10 @@ def _is_pydantic_class(obj: Any) -> bool:
     return isinstance(obj, type) and is_basemodel_subclass(obj)
 
 
-def _lc_tool_call_to_openai_tool_call(tool_call: ToolCall) -> dict:
-    return {
+def _lc_tool_call_to_openai_tool_call(
+    tool_call: ToolCall, extras: dict[str, Any] | None = None
+) -> dict:
+    out: dict[str, Any] = {
         "type": "function",
         "id": tool_call["id"],
         "function": {
@@ -3784,12 +3840,16 @@ def _lc_tool_call_to_openai_tool_call(tool_call: ToolCall) -> dict:
             "arguments": json.dumps(tool_call["args"], ensure_ascii=False),
         },
     }
+    if extras:
+        out.update(extras)
+    return out
 
 
 def _lc_invalid_tool_call_to_openai_tool_call(
     invalid_tool_call: InvalidToolCall,
+    extras: dict[str, Any] | None = None,
 ) -> dict:
-    return {
+    out: dict[str, Any] = {
         "type": "function",
         "id": invalid_tool_call["id"],
         "function": {
@@ -3797,6 +3857,9 @@ def _lc_invalid_tool_call_to_openai_tool_call(
             "arguments": invalid_tool_call["args"],
         },
     }
+    if extras:
+        out.update(extras)
+    return out
 
 
 def _url_to_size(image_source: str) -> tuple[int, int] | None:

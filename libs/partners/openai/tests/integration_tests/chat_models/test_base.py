@@ -542,6 +542,39 @@ def test_tool_use() -> None:
     llm_with_tool.invoke(msgs)
 
 
+@pytest.mark.vcr
+def test_tool_use_gemini_extra_content() -> None:
+    """Multi-turn tool calling against Gemini's OpenAI-compat endpoint.
+
+    Gemini returns each tool_call with an ``extra_content.google.thought_signature``
+    field and 400s on the next turn if it isn't echoed back. This regression
+    test verifies the round-trip through ``langchain-openai``'s converters
+    preserves that field via the ``__openai_tool_call_extras__`` side-channel.
+    """
+    from pydantic import SecretStr
+
+    llm = ChatOpenAI(
+        model="gemini-3-flash-preview",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        api_key=SecretStr(os.environ.get("GEMINI_API_KEY", "fake-key-for-vcr-replay")),
+        temperature=0,
+    ).bind_tools([GenerateUsername])
+
+    msgs: list = [HumanMessage("Sally has green hair, what would her username be?")]
+    ai_msg = llm.invoke(msgs)
+    assert isinstance(ai_msg, AIMessage)
+    assert len(ai_msg.tool_calls) == 1
+    extras = ai_msg.additional_kwargs.get("__openai_tool_call_extras__", {})
+    tc_id = ai_msg.tool_calls[0]["id"]
+    assert tc_id in extras, "expected Gemini extra_content captured under tc id"
+    assert "extra_content" in extras[tc_id]
+
+    tool_msg = ToolMessage("sally_green_hair", tool_call_id=tc_id)
+    msgs.extend([ai_msg, tool_msg])
+    final = llm.invoke(msgs)  # would 400 without the extras round-trip
+    assert isinstance(final, AIMessage)
+
+
 @pytest.mark.parametrize("use_responses_api", [False, True])
 def test_manual_tool_call_msg(use_responses_api: bool) -> None:
     """Test passing in manually construct tool call message."""
